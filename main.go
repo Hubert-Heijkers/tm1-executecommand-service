@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -15,62 +16,29 @@ import (
 	"golang.org/x/sys/windows/svc/eventlog"
 )
 
-var elog debug.Log
+func executeCommand(commandLine string, wait int64) (string, error) {
+	// Split the command-line into executable and arguments
+	cmdParts := strings.Fields(commandLine) // Split the string into command and arguments
 
-type executeCommandService struct{}
+	// The first part should be the executable (or script path)
+	executable := cmdParts[0]
+	args := cmdParts[1:]
 
-func (m *executeCommandService) Execute(args []string, r <-chan svc.ChangeRequest, changes chan<- svc.Status) (svcSpecificEC bool, exitCode uint32) {
-	const cmdsAccepted = svc.AcceptStop | svc.AcceptShutdown
-	changes <- svc.Status{State: svc.StartPending}
-	go runServer()
-	changes <- svc.Status{State: svc.Running, Accepts: cmdsAccepted}
-loop:
-	for c := range r {
-		switch c.Cmd {
-		case svc.Interrogate:
-			changes <- c.CurrentStatus
-		case svc.Stop, svc.Shutdown:
-			break loop
-		default:
-			elog.Error(1, string(c.Cmd))
-		}
+	// Directly invoke the executable with arguments
+	cmd := exec.Command(executable, args...)
+
+	// If 'wait' is 1, run the command and wait for it to finish
+	if wait == 1 {
+		output, err := cmd.CombinedOutput() // Wait for command to finish and get output
+		return string(output), err
 	}
-	changes <- svc.Status{State: svc.StopPending}
-	return
-}
 
-func main() {
-	isWindowsService, err := svc.IsWindowsService()
-	if err != nil {
-		log.Fatalf("failed to determine if we are running in an interactive session: %v", err)
+	// 'wait' is 0, start the command and return immediately
+	if err := cmd.Start(); err != nil {
+		return "", err
 	}
-	if isWindowsService {
-		elog, err = eventlog.Open("ExecuteCommandService")
-		if err != nil {
-			return
-		}
-		defer elog.Close()
-		runWindowsService("ExecuteCommandService")
-	} else {
-		elog = debug.New("ExecuteCommandService")
-		runServer()
-	}
-}
-
-func runWindowsService(name string) {
-	run := svc.Run
-	elog.Info(1, "starting "+name+" service")
-	err := run(name, &executeCommandService{})
-	if err != nil {
-		elog.Error(1, "service "+name+" failed: "+err.Error())
-		return
-	}
-	elog.Info(1, "service "+name+" stopped")
-}
-
-func runServer() {
-	http.HandleFunc("/ExecuteCommand", commandHandler)
-	http.ListenAndServe(":8080", nil)
+	// Return immediately without waiting for the command to finish
+	return "Command started successfully", nil
 }
 
 type executeCommandRequest struct {
@@ -140,7 +108,11 @@ func commandHandler(w http.ResponseWriter, r *http.Request) {
 	// Execute the ExecuteCommand
 	output, err := executeCommand(commandLine, wait)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("Error executing command: %v\nOutput: %s", err, output), http.StatusInternalServerError)
+		if output != "" {
+			http.Error(w, fmt.Sprintf("Error executing command: %v\nOutput: %s", err, output), http.StatusInternalServerError)
+		} else {
+			http.Error(w, fmt.Sprintf("Error executing command: %v", err), http.StatusInternalServerError)
+		}
 		return
 	}
 
@@ -149,27 +121,73 @@ func commandHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(output))
 }
 
-func executeCommand(commandLine string, wait int64) (string, error) {
-	// Split the command-line into executable and arguments
-	cmdParts := strings.Fields(commandLine) // Split the string into command and arguments
+var elog debug.Log
 
-	// The first part should be the executable (or script path)
-	executable := cmdParts[0]
-	args := cmdParts[1:]
+type executeCommandService struct {
+	port string
+}
 
-	// Directly invoke the executable with arguments
-	cmd := exec.Command(executable, args...)
+func (m *executeCommandService) Execute(args []string, r <-chan svc.ChangeRequest, changes chan<- svc.Status) (svcSpecificEC bool, exitCode uint32) {
+	const cmdsAccepted = svc.AcceptStop | svc.AcceptShutdown
+	changes <- svc.Status{State: svc.StartPending}
+	go runServer(m.port)
+	changes <- svc.Status{State: svc.Running, Accepts: cmdsAccepted}
+loop:
+	for c := range r {
+		switch c.Cmd {
+		case svc.Interrogate:
+			changes <- c.CurrentStatus
+		case svc.Stop, svc.Shutdown:
+			break loop
+		default:
+			elog.Error(1, string(c.Cmd))
+		}
+	}
+	changes <- svc.Status{State: svc.StopPending}
+	return
+}
 
-	// If 'wait' is 1, run the command and wait for it to finish
-	if wait == 1 {
-		output, err := cmd.CombinedOutput() // Wait for command to finish and get output
-		return string(output), err
+func runWindowsService(name string, port string) {
+	run := svc.Run
+	elog.Info(1, "starting "+name+" service on port "+port)
+	err := run(name, &executeCommandService{port})
+	if err != nil {
+		elog.Error(1, "service "+name+" failed: "+err.Error())
+		return
+	}
+	elog.Info(1, "service "+name+" stopped")
+}
+
+func runServer(port string) {
+	// Setup the HTTP server and route
+	http.HandleFunc("/ExecuteCommand", commandHandler)
+
+	// Start listening to the user-defined or default port
+	http.ListenAndServe(":"+port, nil)
+}
+
+func main() {
+	// Define a command-line flag for the port, with a default value of 8080
+	port := flag.String("port", "8080", "Port for the HTTP server to listen on")
+	flag.Parse() // Parse the command-line flags
+
+	// Determine if the service is begin started as a Windows service
+	isWindowsService, err := svc.IsWindowsService()
+	if err != nil {
+		log.Fatalf("Failed to determine if we are running in a windows service: %v", err)
 	}
 
-	// 'wait' is 0, start the command and return immediately
-	if err := cmd.Start(); err != nil {
-		return "", err
+	// Start the ExecuteCommand service
+	if isWindowsService {
+		elog, err = eventlog.Open("ExecuteCommandService")
+		if err != nil {
+			return
+		}
+		defer elog.Close()
+		runWindowsService("ExecuteCommandService", *port)
+	} else {
+		fmt.Printf("Starting ExecuteCommand service on port %s...\n", *port)
+		elog = debug.New("ExecuteCommandService")
+		runServer(*port)
 	}
-	// Return immediately without waiting for the command to finish
-	return "Command started successfully", nil
 }
